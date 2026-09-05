@@ -1,0 +1,36 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Age Challenge</title>
+  <link rel="stylesheet" href="styles.css" />
+</head>
+
+<body>
+  <main class="container">
+    <section class="card" id="codePage">
+      <form id="ageGuessForm" autocomplete="off">
+        <div class="top-email" id="displayPlayerName">Player: </div>
+        <p class="eyebrow">AGE CHALLENGE</p>
+        <h1>Enter your age</h1>
+        <label for="age">Age</label>
+        <input
+          id="age"
+          type="number"
+          inputmode="numeric"
+          min="1"
+          max="999999999"
+          placeholder="e.g. 25"
+          required
+        />
+        <button type="submit">Submit age</button>
+        <p id="ageResult" class="result" aria-live="polite" aria-atomic="true"></p>
+      </form>
+    </section>
+  </main>
+  <script src="script.js"></script>
+</body>
+
+</html>

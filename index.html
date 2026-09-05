@@ -1,0 +1,29 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Game Setup - Step 1</title>
+    <link rel="stylesheet" href="styles.css" />
+  </head>
+  <body>
+    <div class="container">
+      <form id="emailForm" class="card">
+        <h1>Step 1: Choose a player name</h1>
+        <p class="notice">This is a local game demo. Do not enter real contact details.</p>
+        <label for="playerName">Player name</label>
+        <input
+          id="playerName"
+          name="playerName"
+          type="text"
+          maxlength="40"
+          placeholder="Enter a temporary name"
+          required
+        />
+        <button type="submit">Continue</button>
+      </form>
+    </div>
+
+    <script src="script.js"></script>
+  </body>
+</html>
